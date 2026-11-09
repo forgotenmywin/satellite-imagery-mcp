@@ -1,0 +1,167 @@
+
+name: Satellite Imagery MCP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: satellite-imagery-mcp
+  cancel-in-progress: true
+
+jobs:
+  run-mcp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify Project Files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f package.json
+          test -f npm-shrinkwrap.json
+          test -f src/server.mjs
+
+          echo "Project files verified."
+          echo "Repository: $GITHUB_REPOSITORY"
+
+      - name: Install Dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Start Satellite Imagery MCP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PORT=3000 nohup node src/server.mjs --http \
+            > "$RUNNER_TEMP/mcp.log" 2>&1 &
+
+          echo $! > "$RUNNER_TEMP/mcp.pid"
+
+          for i in {1..30}; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/mcp.pid")" 2>/dev/null; then
+              cat "$RUNNER_TEMP/mcp.log"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo "MCP process started."
+
+      - name: Install Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+
+          cloudflared --version
+
+      - name: Start Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cloudflared tunnel \
+            --url http://127.0.0.1:3000 \
+            --no-autoupdate \
+            > "$RUNNER_TEMP/cloudflared.log" 2>&1 &
+
+          echo $! > "$RUNNER_TEMP/cloudflared.pid"
+
+          URL=""
+
+          for i in {1..60}; do
+            URL=$(grep -oE \
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              "$RUNNER_TEMP/cloudflared.log" \
+              | head -n 1 || true)
+
+            if [ -n "$URL" ]; then
+              break
+            fi
+
+            if ! kill -0 "$(cat "$RUNNER_TEMP/cloudflared.pid")" 2>/dev/null; then
+              cat "$RUNNER_TEMP/cloudflared.log"
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            cat "$RUNNER_TEMP/cloudflared.log"
+            exit 1
+          fi
+
+          MCP_URL="${URL}/mcp"
+
+          {
+            echo "# Satellite Imagery MCP"
+            echo ""
+            echo "Status: RUNNING"
+            echo ""
+            echo "MCP Endpoint:"
+            echo ""
+            echo "\`$MCP_URL\`"
+            echo ""
+            echo "Transport: Streamable HTTP"
+            echo "Port: 3000"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "MCP_URL=$MCP_URL" >> "$GITHUB_ENV"
+
+          echo "================================"
+          echo "SATELLITE IMAGERY MCP READY"
+          echo "$MCP_URL"
+          echo "================================"
+
+      - name: Keep MCP Alive
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while true; do
+            if ! kill -0 "$(cat "$RUNNER_TEMP/mcp.pid")" 2>/dev/null; then
+              echo "MCP server stopped."
+              cat "$RUNNER_TEMP/mcp.log"
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat "$RUNNER_TEMP/cloudflared.pid")" 2>/dev/null; then
+              echo "Cloudflare tunnel stopped."
+              cat "$RUNNER_TEMP/cloudflared.log"
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+      - name: Upload Diagnostic Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: satellite-imagery-mcp-logs
+          path: |
+            ${{ runner.temp }}/mcp.log
+            ${{ runner.temp }}/cloudflared.log
+          if-no-files-found: ignore
+          retention-days: 3
